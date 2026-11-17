@@ -2,40 +2,41 @@
 
 Сначала создали срез данных c информацией о дате приема и увольнения: 
 ```sql
-CREATE TABLE iceberg__write_access.sandbox_cc.operator_theme_ml_model_v2 AS
-WITH episodes AS (
+CREATE TABLE iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
+WITH (
+    location = ''
+)
+AS
+WITH
+-- 1. Эпизоды для модели.
+
+episodes AS (
     SELECT
-        t.session_id,
-        t.segment,
-        t.login,
-        t.portal_id,
-        t.city,
-        t.fio,
-        t.su,
-        t.med_name,
-        t.bl_type,
-        t.seg_start,
-        t.seg_end,
-        t.handle_duration,
-        MAX(t.client_id) AS client_id,
+        a.session_id,
+        a.segment,
+        a.login,
+        a.portal_id,
+        a.city,
+        a.fio,
+        a.su,
+        a.med_name,
+        a.bl_type,
+        a.seg_start,
+        a.seg_end,
+        a.handle_duration,
+        MAX(a.client_id) AS client_id,
 
         CASE
-            WHEN COUNT(t.start_dt) = COUNT(*)
-             AND MIN(t.start_dt) = MAX(t.start_dt)
-            THEN MIN(t.start_dt)
+            WHEN COUNT(a.start_dt) = COUNT(*)
+             AND MIN(a.start_dt) = MAX(a.start_dt)
+            THEN MIN(a.start_dt)
         END AS start_dt,
 
-        CASE
-            WHEN COUNT(t.seg_start_raw) = COUNT(*)
-             AND MIN(t.seg_start_raw) = MAX(t.seg_start_raw)
-            THEN MIN(t.seg_start_raw)
-        END AS seg_start_raw,
-
-        COUNT_IF(t.channel = 'Chat') = COUNT(*) AS is_chat,
+        COUNT_IF(a.channel = 'Chat') = COUNT(*) AS is_chat,
 
         ARRAY_AGG(
             CAST(
-                ROW(t.theme, t.level1, t.level2, t.level3)
+                ROW(a.theme, a.level1, a.level2, a.level3)
                 AS ROW(
                     theme  VARCHAR,
                     level1 VARCHAR,
@@ -43,130 +44,139 @@ WITH episodes AS (
                     level3 VARCHAR
                 )
             )
-            ORDER BY t.created_date NULLS LAST
+            ORDER BY a.created_date NULLS LAST
         ) AS theme_sequence
 
-    FROM iceberg__write_access.sandbox_cc.themesflow_new t
-    WHERE t.taken_flg = 1
-      AND t.bl_type IN ('Голос ФЛ', 'Чат ФЛ')
+    FROM iceberg__write_access.sandbox_cc.themesflow_new a
+    WHERE a.taken_flg = 1
+      AND a.bl_type IN ('Чат ФЛ', 'Голос ФЛ')
     GROUP BY
-        t.session_id, t.segment, t.login, t.portal_id,
-        t.city, t.fio, t.su, t.med_name, t.bl_type,
-        t.seg_start, t.seg_end, t.handle_duration
+        a.session_id, a.segment, a.login, a.portal_id,
+        a.city, a.fio, a.su, a.med_name, a.bl_type,
+        a.seg_start, a.seg_end, a.handle_duration
 ),
 
-transfer_flags AS (
-    SELECT
-        session_id,
-        segment,
-        COALESCE(
-            CASE
-                WHEN transfer_med_name = 'CC_INBOUND_2LINE' THEN 0
-                ELSE transfer_flg
-            END,
-            0
-        ) AS flag
-    FROM iceberg__write_access.sandbox_cc.callflow_transfers_new
-),
+-- 2. Ключи чата
 
-transfers AS (
-    SELECT
-        session_id,
-        segment,
-        MIN(flag) AS transfer_flag,
-        MIN(flag) = MAX(flag) AS consistent
-    FROM transfer_flags
-    GROUP BY session_id, segment
-),
-
-episode_keys AS (
-    SELECT
-        e.*,
-        CASE
-            WHEN COALESCE(tr.consistent, TRUE)
-            THEN COALESCE(tr.transfer_flag, 0)
-        END AS transfer_flag
-    FROM episodes e
-    LEFT JOIN transfers tr
-        ON e.bl_type = 'Голос ФЛ'
-       AND e.session_id = tr.session_id
-       AND e.segment = tr.segment
-),
-
-plan_keys AS (
+chat_keys AS (
     SELECT DISTINCT
-        bl_type,
         login,
         med_name,
         start_dt,
-        CASE
-            WHEN bl_type = 'Голос ФЛ' THEN seg_start_raw
-            ELSE seg_start
-        END AS plan_time,
-        transfer_flag
-    FROM episode_keys
-    WHERE start_dt IS NOT NULL
-      AND (
-          (bl_type = 'Чат ФЛ' AND is_chat)
-          OR
-          (bl_type = 'Голос ФЛ' AND transfer_flag IS NOT NULL)
-      )
+        seg_start
+    FROM episodes
+    WHERE bl_type = 'Чат ФЛ'
+      AND is_chat
+      AND start_dt IS NOT NULL
 ),
 
-matched_plans AS (
-    SELECT
-        k.*,
-        CAST(p.aht_target AS DOUBLE) AS target_sec
-    FROM plan_keys k
+-- 3. Норматив чата
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_experience_new s
-        ON LOWER(k.login) = LOWER(s.naumen_login)
-       AND k.start_dt = s.dt
-       AND k.med_name = s.project_name
+chat_matches AS (
+    SELECT
+        a.login,
+        a.med_name,
+        a.start_dt,
+        a.seg_start,
+        CAST(p.aht_target AS DOUBLE) AS target_sec
+
+    FROM chat_keys a
 
     LEFT JOIN iceberg__write_access.sandbox_cc.dict_chat_sessions c
-        ON k.bl_type = 'Чат ФЛ'
-       AND LOWER(k.login) = LOWER(c.naumen_login)
-       AND CAST(k.start_dt AS TIMESTAMP(6))
+        ON LOWER(a.login) = LOWER(c.naumen_login)
+       AND CAST(a.start_dt AS TIMESTAMP(6))
            BETWEEN c.startdate AND c.enddate
 
+    LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_experience_new s
+        ON LOWER(a.login) = LOWER(s.naumen_login)
+       AND a.start_dt = s.dt
+       AND a.med_name = s.project_name
+
     LEFT JOIN iceberg__write_access.sandbox_cc.dict_target_aht p
-        ON k.med_name = p.project_name
+        ON a.med_name = p.project_name
+       AND a.seg_start BETWEEN CAST(p.valid_from AS DATE)
+                           AND CAST(p.valid_to AS DATE)
        AND s.experience_months = p.experience
-       AND (
-           (
-               k.bl_type = 'Голос ФЛ'
-               AND k.plan_time BETWEEN p.valid_from AND p.valid_to
-               AND k.transfer_flag = COALESCE(p.transfer_flg, 0)
-           )
-           OR
-           (
-               k.bl_type = 'Чат ФЛ'
-               AND k.plan_time BETWEEN CAST(p.valid_from AS DATE)
-                                   AND CAST(p.valid_to AS DATE)
-               AND COALESCE(CAST(c.field_value_2 AS INTEGER), 3) = p.sessions_cnt
-           )
-       )
+       AND COALESCE(CAST(c.field_value_2 AS INTEGER), 3) = p.sessions_cnt
 ),
 
-plans AS (
+-- 4. Один AHT на ключ чата
+
+chat_plans AS (
     SELECT
-        bl_type,
         login,
         med_name,
         start_dt,
-        plan_time,
-        transfer_flag,
+        seg_start,
         CASE
             WHEN COUNT(target_sec) = COUNT(*)
              AND MIN(target_sec) = MAX(target_sec)
              AND MIN(target_sec) > 0
             THEN MIN(target_sec)
         END AS aht_target
-    FROM matched_plans
-    GROUP BY bl_type, login, med_name, start_dt, plan_time, transfer_flag
+    FROM chat_matches
+    GROUP BY login, med_name, start_dt, seg_start
+),
+
+-- 5. Норматив голоса
+
+voice_matches AS (
+    SELECT
+        a.session_id,
+        a.segment,
+        LOWER(a.login) AS login_key,
+        a.med_name,
+        COALESCE(
+            CASE
+                WHEN b.transfer_med_name = 'CC_INBOUND_2LINE' THEN 0
+                ELSE b.transfer_flg
+            END,
+            0
+        ) AS transfer_flag,
+        a.start_dt,
+        a.seg_start_raw
+    FROM iceberg__write_access.sandbox_cc.callflow_new a
+
+    LEFT JOIN iceberg__write_access.sandbox_cc.callflow_transfers_new b
+        ON a.session_id = b.session_id
+       AND a.segment = b.segment
+
+    WHERE a.taken_flg = 1
+),
+
+-- 6. Один AHT на голосовой сегмент оператора
+
+voice_plans AS (
+    SELECT
+        a.session_id,
+        a.segment,
+        a.login_key,
+        a.med_name,
+        CASE
+            WHEN MIN(a.transfer_flag) = MAX(a.transfer_flag)
+             AND COUNT(p.aht_target) = COUNT(*)
+             AND MIN(CAST(p.aht_target AS DOUBLE)) = MAX(CAST(p.aht_target AS DOUBLE))
+             AND MIN(CAST(p.aht_target AS DOUBLE)) > 0
+            THEN MIN(CAST(p.aht_target AS DOUBLE))
+        END AS aht_target
+
+    FROM voice_matches a
+
+    LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_experience_new s
+        ON a.login_key = LOWER(s.naumen_login)
+       AND a.start_dt = s.dt
+       AND a.med_name = s.project_name
+
+    LEFT JOIN iceberg__write_access.sandbox_cc.dict_target_aht p
+        ON a.med_name = p.project_name
+       AND a.seg_start_raw BETWEEN p.valid_from AND p.valid_to
+       AND s.experience_months = p.experience
+       AND a.transfer_flag = COALESCE(p.transfer_flg, 0)
+
+    GROUP BY a.session_id, a.segment, a.login_key, a.med_name
 )
 
+-- Итог: эпизод с темами, фактической длительностью, кадровыми датами
 SELECT
     e.session_id,
     e.segment,
@@ -194,28 +204,49 @@ SELECT
         ELSE d2.fired_date
     END AS fired_date,
 
-    p.aht_target
+    CASE
+        WHEN e.bl_type = 'Чат ФЛ' THEN c.aht_target
+        WHEN e.bl_type = 'Голос ФЛ' THEN v.aht_target
+    END AS aht_target
 
-FROM episode_keys e
+FROM episodes e
+
+LEFT JOIN chat_plans c
+    ON e.bl_type = 'Чат ФЛ'
+   AND e.is_chat
+   AND e.login = c.login
+   AND e.med_name = c.med_name
+   AND e.start_dt = c.start_dt
+   AND e.seg_start = c.seg_start
+
+LEFT JOIN voice_plans v
+    ON e.bl_type = 'Голос ФЛ'
+   AND e.session_id = v.session_id
+   AND e.segment = v.segment
+   AND LOWER(e.login) = v.login_key
+   AND e.med_name = v.med_name
 
 LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_raw_new d1
     ON LOWER(TRIM(e.login)) = LOWER(TRIM(d1.naumen_login))
 
 LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_raw_new d2
     ON d1.naumen_login IS NULL
-   AND e.portal_id = d2.portal_id
+   AND e.portal_id = d2.portal_id;
+   
+   
 
-LEFT JOIN plans p
-    ON e.bl_type = p.bl_type
-   AND e.login = p.login
-   AND e.med_name = p.med_name
-   AND e.start_dt = p.start_dt
-   AND e.transfer_flag = p.transfer_flag
-   AND p.plan_time = CASE
-       WHEN e.bl_type = 'Голос ФЛ' THEN e.seg_start_raw
-       ELSE e.seg_start
-   END
-   AND (e.bl_type = 'Голос ФЛ' OR e.is_chat);
+---- Проверка ----
+
+SELECT
+    bl_type,
+    COUNT(*) AS episodes,
+    COUNT(*) - COUNT(DISTINCT ROW(session_id, segment, login, seg_start))
+        AS extra_rows,
+    COUNT(aht_target) AS episodes_with_plan,
+    ROUND(100.0 * COUNT(aht_target) / COUNT(*), 1) AS coverage_pct
+FROM iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
+GROUP BY bl_type
+ORDER BY bl_type;
 ```
 
 ### Загрузка данных в DataFrame
