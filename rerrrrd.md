@@ -439,6 +439,8 @@ display(
 
 ### Модель Ridge и тематическая витрина
 
+Начни с готового `df_model`. Выбери отчётный месяц в первой ячейке и выполняй ячейки по порядку. Результат — `operator_topic_fact`, одна строка на тему сегмента сотрудника.
+
 #### 1. Период обучения и расчёта
 
 Отчётный месяц идёт в test. Обучение использует предыдущие месяцы и исключает сессии из test.
@@ -470,6 +472,11 @@ train = data.loc[data["seg_start"] < start, [
     "session_id", "login", "med_name", "bl_type", "topics", "tenure_days", "handle_duration"
 ]].copy()
 train = train.loc[~train["session_id"].isin(test["session_id"])]
+
+if test.empty:
+    raise ValueError("Нет сегментов за выбранный месяц.")
+if test[episode_key].isna().any().any() or test.duplicated(episode_key).any():
+    raise ValueError("Проверь ключ сегмента: обнаружены пропуски или повторы.")
 
 for frame in (train, test):
     frame["topics"] = frame["topics"].map(lambda seq: list(dict.fromkeys(seq)))
@@ -607,6 +614,8 @@ for channel, history in train.groupby("bl_type"):
         if len(effects) < 2:
             continue
 
+        # Одинаковые эффекты дают одинаковую медиану остальных.
+        # Достаточно трёх вариантов: ниже середины, в середине и выше.
         middle = np.median(effects)
         for mask in [effects < middle, effects == middle, effects > middle]:
             positions = np.flatnonzero(mask)
@@ -770,3 +779,108 @@ display(operator_topic_fact.head())
 ```
 
 В двухтемном сегменте `handle_duration` и `aht_duration` повторяются в обеих строках. Складывай `topic_duration` и `topic_plan_seconds`. Флаг `is_estimated` равен 1 для обоих способов разделения пары и 0 для однотемного сегмента.
+
+## Аналитический отчёт за отчётный месяц
+
+#### 1. Подготовить данные
+
+Каждая тема встречается в сегменте один раз. В расчёт плана и факта включаем одни и те же строки с известным нормативом. Для двухтемных сегментов берём выделенную теме долю секунд.
+
+```python
+source = operator_topic_fact
+topic_keys = ["report_month", "bl_type", "med_name", "level1", "level2", "level3"]
+person_keys = topic_keys + ["login"]
+
+known_plan = source["topic_plan_seconds"].gt(0)
+report = source.assign(fact_with_plan=source["topic_duration"].where(known_plan))
+```
+
+#### 2. Посчитать результат каждого сотрудника на теме
+
+Счётчики проверки уже рассчитаны в модели и повторяются на строках одной группы. Берём их один раз. Эпизоды и распределённые секунды суммируем по строкам темы.
+
+```python
+people = report.groupby(person_keys, dropna=False, sort=False).agg(
+    episodes=("login", "size"),
+    with_plan=("fact_with_plan", "count"),
+    estimated=("is_estimated", "sum"),
+    fact_sec=("fact_with_plan", "sum"),
+    plan_sec=("topic_plan_seconds", "sum"),
+    single_episodes=("test_episodes", "first"),
+    peer_episodes=("peer_episodes", "first"),
+    peer_operators=("peer_operators", "first"),
+    peer_gap_pct=("test_difference_pct", "first"),
+    confirmed=("confirmed_lag", "first"),
+).reset_index()
+
+n = people["with_plan"].replace(0, np.nan)
+people["fact_avg_sec"] = people["fact_sec"] / n
+people["plan_avg_sec"] = people["plan_sec"] / n
+people["plan_pct"] = 100 * people["plan_sec"] / people["fact_sec"].where(n.notna())
+people["over_sec"] = (people["fact_sec"] - people["plan_sec"]).where(n.notna())
+people["estimated_pct"] = 100 * people["estimated"] / people["episodes"]
+```
+
+#### 3. Определить кандидатов на обучение
+
+Сотрудник попадает в список, если по теме превышен норматив и модель подтвердила отставание. confirmed_lag уже требует положительных peer_score и within_score, ≥30 эпизодов на train, ≥20 однотемных у сотрудника на test, ≥30 у коллег, ≥3 коллег и отставание по медиане ≥20%. Для назначений берём сотрудников, работающих на последнюю дату данных отчётного месяца.
+
+```python
+as_of = source.groupby("report_month")["seg_start"].transform("max").dt.normalize()
+active = source["employment_date"].le(as_of) & (
+    source["fired_date"].isna() | source["fired_date"].gt(as_of)
+)
+staff = source.loc[active, ["report_month", "login"]].drop_duplicates()
+people = people.merge(staff.assign(active=True), on=["report_month", "login"],
+                      how="left", validate="many_to_one")
+
+people["below_plan"] = people["over_sec"].gt(0)
+people["to_train"] = people["below_plan"] & people["confirmed"] & people["active"].eq(True)
+```
+
+#### 4. Срез по сотрудникам
+
+Одна строка — одно назначение. У каждого сотрудника первой показываем тему с наибольшим суммарным превышением. Факт и план в среднем рассчитаны на эпизод с известным нормативом.
+
+```python
+labels = {
+    "report_month": "Месяц", "login": "Сотрудник", "bl_type": "Канал", "med_name": "Проект",
+    "level1": "Уровень 1", "level2": "Уровень 2", "level3": "Уровень 3",
+    "episodes": "Эпизодов", "with_plan": "С нормативом", "estimated_pct": "Из двухтемных, %",
+    "single_episodes": "Однотемных у сотрудника", "peer_episodes": "Однотемных у коллег",
+    "peer_operators": "Коллег", "peer_gap_pct": "Дольше коллег, %",
+    "plan_avg_sec": "План на эпизод, с", "fact_avg_sec": "Факт на эпизод, с",
+    "plan_pct": "Выполнение, %", "over_sec": "Превышение за месяц, с",
+}
+employee_report = (
+    people.loc[people["to_train"]].sort_values(
+        ["report_month", "login", "over_sec"], ascending=[True, True, False]
+    )[list(labels)].rename(columns=labels).reset_index(drop=True)
+)
+display(employee_report.round(1))
+```
+
+#### 5. Срез по темам
+
+Считаем сотрудников по всей теме внутри месяца, канала и проекта. В число сотрудников ниже плана входят все, у кого факт выше норматива, включая тех, кому не хватило данных для подтверждения. Для организации обучения отдельно показываем число действующих кандидатов и их суммарное превышение.
+
+```python
+topic_report = (
+    people.assign(training_sec=people["over_sec"].where(people["to_train"], 0))
+    .groupby(topic_keys, dropna=False, sort=False)
+    .agg(
+        operators=("login", "size"),
+        evaluated=("plan_pct", "count"),
+        missed=("below_plan", "sum"),
+        candidates=("to_train", "sum"),
+        training_sec=("training_sec", "sum"),
+    ).reset_index()
+)
+topic_report["missed_pct"] = 100 * topic_report["missed"] / topic_report["evaluated"].replace(0, np.nan)
+topic_report = topic_report.sort_values(
+    ["candidates", "training_sec", "missed"], ascending=False
+).rename(columns={**labels, "operators": "Сотрудников", "evaluated": "С известным планом",
+                  "missed": "Ниже плана", "missed_pct": "Ниже плана, %",
+                  "candidates": "На обучение", "training_sec": "Превышение кандидатов, с"})
+display(topic_report.reset_index(drop=True).round(1))
+```
