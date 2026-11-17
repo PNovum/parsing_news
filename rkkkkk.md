@@ -2,16 +2,17 @@
 
 Сначала создали срез данных c информацией о дате приема и увольнения: 
 ```sql
-CREATE TABLE iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
-WITH (
+create table iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
+with (
     location = ''
 )
-AS
-WITH
--- 1. Эпизоды для модели.
+as
+with
 
-episodes AS (
-    SELECT
+-- 1. Собираем темы и фактическую длительность на уровне сегмента оператора
+
+episodes as (
+    select
         a.session_id,
         a.segment,
         a.login,
@@ -24,160 +25,163 @@ episodes AS (
         a.seg_start,
         a.seg_end,
         a.handle_duration,
-        MAX(a.client_id) AS client_id,
+        max(a.client_id) as client_id,
 
-        CASE
-            WHEN COUNT(a.start_dt) = COUNT(*)
-             AND MIN(a.start_dt) = MAX(a.start_dt)
-            THEN MIN(a.start_dt)
-        END AS start_dt,
+        case
+            when count(a.start_dt) = count(*)
+             and min(a.start_dt) = max(a.start_dt)
+            then min(a.start_dt)
+        end as start_dt,
 
-        COUNT_IF(a.channel = 'Chat') = COUNT(*) AS is_chat,
+        count_if(a.channel = 'Chat') = count(*) as is_chat,
 
-        ARRAY_AGG(
-            CAST(
-                ROW(a.theme, a.level1, a.level2, a.level3)
-                AS ROW(
-                    theme  VARCHAR,
-                    level1 VARCHAR,
-                    level2 VARCHAR,
-                    level3 VARCHAR
+        array_agg(
+            cast(
+                row(a.theme, a.level1, a.level2, a.level3)
+                as row(
+                    theme  varchar,
+                    level1 varchar,
+                    level2 varchar,
+                    level3 varchar
                 )
             )
-            ORDER BY a.created_date NULLS LAST
-        ) AS theme_sequence
+            order by a.created_date nulls last
+        ) as theme_sequence
 
-    FROM iceberg__write_access.sandbox_cc.themesflow_new a
-    WHERE a.taken_flg = 1
-      AND a.bl_type IN ('Чат ФЛ', 'Голос ФЛ')
-    GROUP BY
+    from iceberg__write_access.sandbox_cc.themesflow_new a
+
+    where a.taken_flg = 1
+      and a.bl_type in ('Чат ФЛ', 'Голос ФЛ')
+
+    group by
         a.session_id, a.segment, a.login, a.portal_id,
         a.city, a.fio, a.su, a.med_name, a.bl_type,
         a.seg_start, a.seg_end, a.handle_duration
 ),
 
--- 2. Ключи чата
-
-chat_keys AS (
-    SELECT DISTINCT
+-- 2. Выбираем уникальные сочетания полей, по которым ищем план чата
+chat_keys as (
+    select distinct
         login,
         med_name,
         start_dt,
         seg_start
-    FROM episodes
-    WHERE bl_type = 'Чат ФЛ'
-      AND is_chat
-      AND start_dt IS NOT NULL
+    from episodes
+    where bl_type = 'Чат ФЛ'
+      and is_chat
+      and start_dt is not null
 ),
 
--- 3. Норматив чата
-
-chat_matches AS (
-    SELECT
+-- 3. Ищем план чата по проекту, периоду, стажу и числу параллельных сессий
+chat_matches as (
+    select
         a.login,
         a.med_name,
         a.start_dt,
         a.seg_start,
-        CAST(p.aht_target AS DOUBLE) AS target_sec
+        cast(p.aht_target as double) as target_sec
 
-    FROM chat_keys a
+    from chat_keys a
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_chat_sessions c
-        ON LOWER(a.login) = LOWER(c.naumen_login)
-       AND CAST(a.start_dt AS TIMESTAMP(6))
-           BETWEEN c.startdate AND c.enddate
+    left join iceberg__write_access.sandbox_cc.dict_chat_sessions c
+        on lower(a.login) = lower(c.naumen_login)
+       and cast(a.start_dt as timestamp(6)) between c.startdate and c.enddate
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_experience_new s
-        ON LOWER(a.login) = LOWER(s.naumen_login)
-       AND a.start_dt = s.dt
-       AND a.med_name = s.project_name
+    left join iceberg__write_access.sandbox_cc.dict_emp_experience_new s
+        on lower(a.login) = lower(s.naumen_login)
+       and a.start_dt = s.dt
+       and a.med_name = s.project_name
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_target_aht p
-        ON a.med_name = p.project_name
-       AND a.seg_start BETWEEN CAST(p.valid_from AS DATE)
-                           AND CAST(p.valid_to AS DATE)
-       AND s.experience_months = p.experience
-       AND COALESCE(CAST(c.field_value_2 AS INTEGER), 3) = p.sessions_cnt
+    left join iceberg__write_access.sandbox_cc.dict_target_aht p
+        on a.med_name = p.project_name
+       and a.seg_start between cast(p.valid_from as date)
+                           and cast(p.valid_to as date)
+       and s.experience_months = p.experience
+       and coalesce(cast(c.field_value_2 as integer), 3) = p.sessions_cnt
 ),
 
--- 4. Один AHT на ключ чата
+-- 4. Возвращаем одну строку на ключ чата
 
-chat_plans AS (
-    SELECT
+chat_plans as (
+    select
         login,
         med_name,
         start_dt,
         seg_start,
-        CASE
-            WHEN COUNT(target_sec) = COUNT(*)
-             AND MIN(target_sec) = MAX(target_sec)
-             AND MIN(target_sec) > 0
-            THEN MIN(target_sec)
-        END AS aht_target
-    FROM chat_matches
-    GROUP BY login, med_name, start_dt, seg_start
+        case
+            when count(target_sec) = count(*)
+             and min(target_sec) = max(target_sec)
+             and min(target_sec) > 0
+            then min(target_sec)
+        end as aht_target
+
+    from chat_matches
+    group by login, med_name, start_dt, seg_start
 ),
 
--- 5. Норматив голоса
+-- 5. Берём принятые голосовые сегменты из callflow_new.
 
-voice_matches AS (
-    SELECT
+voice_segments as (
+    select
         a.session_id,
         a.segment,
-        LOWER(a.login) AS login_key,
+        lower(a.login) as login_key,
         a.med_name,
-        COALESCE(
-            CASE
-                WHEN b.transfer_med_name = 'CC_INBOUND_2LINE' THEN 0
-                ELSE b.transfer_flg
-            END,
-            0
-        ) AS transfer_flag,
         a.start_dt,
-        a.seg_start_raw
-    FROM iceberg__write_access.sandbox_cc.callflow_new a
+        a.seg_start_raw,
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.callflow_transfers_new b
-        ON a.session_id = b.session_id
-       AND a.segment = b.segment
+        coalesce(
+            case
+                when b.transfer_med_name = 'CC_INBOUND_2LINE' then 0
+                else b.transfer_flg
+            end,
+            0
+        ) as transfer_flag
 
-    WHERE a.taken_flg = 1
+    from iceberg__write_access.sandbox_cc.callflow_new a
+
+    left join iceberg__write_access.sandbox_cc.callflow_transfers_new b
+        on a.session_id = b.session_id
+       and a.segment = b.segment
+
+    where a.taken_flg = 1
 ),
 
--- 6. Один AHT на голосовой сегмент оператора
+-- 6. Ищем план голоса по проекту, seg_start_raw, стажу и признаку перевода.
 
-voice_plans AS (
-    SELECT
+voice_plans as (
+    select
         a.session_id,
         a.segment,
         a.login_key,
         a.med_name,
-        CASE
-            WHEN MIN(a.transfer_flag) = MAX(a.transfer_flag)
-             AND COUNT(p.aht_target) = COUNT(*)
-             AND MIN(CAST(p.aht_target AS DOUBLE)) = MAX(CAST(p.aht_target AS DOUBLE))
-             AND MIN(CAST(p.aht_target AS DOUBLE)) > 0
-            THEN MIN(CAST(p.aht_target AS DOUBLE))
-        END AS aht_target
 
-    FROM voice_matches a
+        case
+            when min(a.transfer_flag) = max(a.transfer_flag)
+             and count(p.aht_target) = count(*)
+             and min(cast(p.aht_target as double)) = max(cast(p.aht_target as double))
+             and min(cast(p.aht_target as double)) > 0
+            then min(cast(p.aht_target as double))
+        end as aht_target
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_experience_new s
-        ON a.login_key = LOWER(s.naumen_login)
-       AND a.start_dt = s.dt
-       AND a.med_name = s.project_name
+    from voice_segments a
 
-    LEFT JOIN iceberg__write_access.sandbox_cc.dict_target_aht p
-        ON a.med_name = p.project_name
-       AND a.seg_start_raw BETWEEN p.valid_from AND p.valid_to
-       AND s.experience_months = p.experience
-       AND a.transfer_flag = COALESCE(p.transfer_flg, 0)
+    left join iceberg__write_access.sandbox_cc.dict_emp_experience_new s
+        on a.login_key = lower(s.naumen_login)
+       and a.start_dt = s.dt
+       and a.med_name = s.project_name
 
-    GROUP BY a.session_id, a.segment, a.login_key, a.med_name
+    left join iceberg__write_access.sandbox_cc.dict_target_aht p
+        on a.med_name = p.project_name
+       and a.seg_start_raw between p.valid_from and p.valid_to
+       and s.experience_months = p.experience
+       and a.transfer_flag = coalesce(p.transfer_flg, 0)
+
+    group by a.session_id, a.segment, a.login_key, a.med_name
 )
 
--- Итог: эпизод с темами, фактической длительностью, кадровыми датами
-SELECT
+-- Итог: тематический сегмент, кадровые даты и единый aht_target.
+select
     e.session_id,
     e.segment,
     e.client_id,
@@ -194,46 +198,44 @@ SELECT
     e.handle_duration,
     e.theme_sequence,
 
-    CASE
-        WHEN d1.naumen_login IS NOT NULL THEN d1.employment_date
-        ELSE d2.employment_date
-    END AS employment_date,
+    case
+        when d1.naumen_login is not null then d1.employment_date
+        else d2.employment_date
+    end as employment_date,
 
-    CASE
-        WHEN d1.naumen_login IS NOT NULL THEN d1.fired_date
-        ELSE d2.fired_date
-    END AS fired_date,
+    case
+        when d1.naumen_login is not null then d1.fired_date
+        else d2.fired_date
+    end as fired_date,
 
-    CASE
-        WHEN e.bl_type = 'Чат ФЛ' THEN c.aht_target
-        WHEN e.bl_type = 'Голос ФЛ' THEN v.aht_target
-    END AS aht_target
+    case
+        when e.bl_type = 'Чат ФЛ' then c.aht_target
+        when e.bl_type = 'Голос ФЛ' then v.aht_target
+    end as aht_target
 
-FROM episodes e
+from episodes e
 
-LEFT JOIN chat_plans c
-    ON e.bl_type = 'Чат ФЛ'
-   AND e.is_chat
-   AND e.login = c.login
-   AND e.med_name = c.med_name
-   AND e.start_dt = c.start_dt
-   AND e.seg_start = c.seg_start
+left join chat_plans c
+    on e.bl_type = 'Чат ФЛ'
+   and e.is_chat
+   and e.login = c.login
+   and e.med_name = c.med_name
+   and e.start_dt = c.start_dt
+   and e.seg_start = c.seg_start
 
-LEFT JOIN voice_plans v
-    ON e.bl_type = 'Голос ФЛ'
-   AND e.session_id = v.session_id
-   AND e.segment = v.segment
-   AND LOWER(e.login) = v.login_key
-   AND e.med_name = v.med_name
+left join voice_plans v
+    on e.bl_type = 'Голос ФЛ'
+   and e.session_id = v.session_id
+   and e.segment = v.segment
+   and lower(e.login) = v.login_key
+   and e.med_name = v.med_name
 
-LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_raw_new d1
-    ON LOWER(TRIM(e.login)) = LOWER(TRIM(d1.naumen_login))
+left join iceberg__write_access.sandbox_cc.dict_emp_raw_new d1
+    on lower(trim(e.login)) = lower(trim(d1.naumen_login))
 
-LEFT JOIN iceberg__write_access.sandbox_cc.dict_emp_raw_new d2
-    ON d1.naumen_login IS NULL
-   AND e.portal_id = d2.portal_id;
-   
-   
+left join iceberg__write_access.sandbox_cc.dict_emp_raw_new d2
+    on d1.naumen_login is null
+   and e.portal_id = d2.portal_id;
 
 ---- Проверка ----
 
