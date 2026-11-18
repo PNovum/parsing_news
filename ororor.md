@@ -1,3 +1,7 @@
+# Темы операторов · ежемесячный расчёт
+
+Результаты расчёта — детальная витрина `operator_topic_fact` для БД и список назначений `employee_report`. Ячейки выполняются сверху вниз до списка назначений. В конце собраны необязательные проверки.
+
 ### SQL запрос
 
 Сначала создали срез данных c информацией о дате приема и увольнения: 
@@ -537,19 +541,12 @@ display(
 
 #### 1. Период обучения и расчёта
 
-Отчётный месяц идёт в test. Обучение использует предыдущие месяцы и исключает сессии из test.
+Выберите отчётный месяц. При None используется последний месяц загруженных данных. Ridge обучается на более ранних сегментах без сессий отчётного месяца.
 
 ```python
-import json
 import numpy as np
-import pandas as pd
 
-from sklearn.feature_extraction import DictVectorizer
-from sklearn.linear_model import Ridge
-
-report_month = None  # например, "2026-10"; None — последний месяц выгрузки
-alpha_by_channel = {"Чат ФЛ": 30, "Голос ФЛ": 30}
-episode_key = ["bl_type", "session_id", "segment", "login", "seg_start"]
+report_month = None
 eligible = (
     df_model["n_topics"].isin([1, 2])
     & np.isfinite(df_model["handle_duration"])
@@ -563,7 +560,7 @@ end = (month + 1).start_time
 data = df_model.loc[eligible]
 test = data.loc[data["seg_start"].between(start, end, inclusive="left")].copy()
 train = data.loc[data["seg_start"] < start, [
-    "session_id", "login", "med_name", "bl_type", "topics", "tenure_days", "handle_duration"
+    "session_id", "login", "med_name", "bl_type", "topics", "tenure_days", "handle_duration", "seg_start"
 ]].copy()
 train = train.loc[~train["session_id"].isin(test["session_id"])]
 
@@ -572,16 +569,22 @@ if test.empty:
 if test[episode_key].isna().any().any() or test.duplicated(episode_key).any():
     raise ValueError("Проверь ключ сегмента: обнаружены пропуски или повторы.")
 
+if train.empty:
+    raise ValueError("Для выбранного месяца нет истории обучения.")
+
 for frame in (train, test):
     frame["topics"] = frame["topics"].map(lambda seq: list(dict.fromkeys(seq)))
-print(month, "train:", len(train), "test:", len(test))
 ```
 
 #### 2. Признаки сегмента
 
-Каждая из двух уникальных тем получает вес ½ в признаках Ridge. В обоих каналах стаж считается от employment_date до даты сегмента. Для пропусков берём медиану стажа на train соответствующего канала.
+Учитываем сотрудника, проект, стаж и темы обращения. Каждая из двух тем получает вес ½.
 
 ```python
+import json
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.linear_model import Ridge
+
 def pair_key(login, topic):
     return "pair_" + json.dumps([login, topic], ensure_ascii=False)
 
@@ -601,14 +604,13 @@ def make_features(frame, fill_days):
         for topic in row.topics:
             f["topic_" + json.dumps(topic, ensure_ascii=False)] = weight
             f[pair_key(row.login, topic)] = weight
-		    f["tp_" + json.dumps(
-			    [str(row.med_name), topic],ensure_ascii=False)] = weight
+            f["tp_" + json.dumps([str(row.med_name), topic], ensure_ascii=False)] = weight
         yield f
 ```
 
 #### 3. Обучение по каналам
 
-Каждый канал получает собственную модель длительности. Стартовый alpha для обоих каналов равен 30.
+Для голоса и чата обучаем отдельные модели логарифма длительности с alpha=30.
 
 ```python
 models = {}
@@ -620,76 +622,15 @@ for channel, history in train.groupby("bl_type"):
     vec = DictVectorizer(dtype=np.float32)
     X = vec.fit_transform(make_features(history, fill_days))
 
-    model = Ridge(alpha=alpha_by_channel[channel], solver="lsqr")
+    model = Ridge(alpha=30, solver="lsqr")
     model.fit(X, np.log(history["handle_duration"]))
     models[channel] = (vec, model, fill_days)
     del X
 ```
 
-#### MAE в секундах на train и test
-
-Для всех эпизодов baseline — медиана канала на train. Для однотемных — медиана канала, проекта и темы на train с подстановкой медианы канала для новой темы. Положительный improvement_pct означает меньшую MAE у Ridge.
-
-```python
-keys = ["bl_type", "med_name", "topic"]
-
-train_single = train[train["topics"].str.len() == 1].copy()
-train_single["topic"] = train_single["topics"].str[0]
-
-topic_median = (
-    train_single.groupby(keys, dropna=False)["handle_duration"]
-    .median()
-    .rename("topic_baseline")
-    .reset_index()
-)
-
-channel_median = train.groupby("bl_type")["handle_duration"].median()
-
-metrics = []
-
-for name, frame in [("train", train), ("test", test)]:
-    check = frame.copy()
-    check["prediction"] = np.nan
-    for channel, part in check.groupby("bl_type"):
-        if channel in models:
-            vec, model, fill_days = models[channel]
-            X = vec.transform(make_features(part, fill_days))
-            check.loc[part.index, "prediction"] = np.exp(model.predict(X))
-    check = check.dropna(subset=["prediction"])
-    check["channel_baseline"] = check["bl_type"].map(channel_median)
-    check["topic"] = check["topics"].str[0]
-    check = check.merge(topic_median, on=keys, how="left", validate="many_to_one")
-    check["topic_baseline"] = check["topic_baseline"].fillna(
-        check["channel_baseline"]
-    )
-
-    for scope in ["все", "одна тема"]:
-        sample = check if scope == "все" else check[check["topics"].str.len() == 1]
-
-        for bl_type, part in sample.groupby("bl_type"):
-            y = part["handle_duration"]
-            model_mae = (y - part["prediction"]).abs().mean()
-            baseline = "channel_baseline" if scope == "все" else "topic_baseline"
-            baseline_mae = (y - part[baseline]).abs().mean()
-
-            metrics.append({
-                "sample": name,
-                "scope": scope,
-                "bl_type": bl_type,
-                "episodes": len(part),
-                "model_mae": model_mae,
-                "baseline_mae": baseline_mae,
-                "improvement_pct": 100 * (1 - model_mae / baseline_mae)
-                if baseline_mae > 0 else np.nan,
-            })
-
-model_quality = pd.DataFrame(metrics)
-display(model_quality.round(1))
-```
-
 #### 4. Скоры сотрудника
 
-within_score сравнивает тему с другими темами сотрудника. peer_score_pct сравнивает его с остальными операторами на этой теме в том же канале.
+История пары должна содержать ≥20 эпизодов, внутренний скор должен превышать 0,15. Отклонение от коллег рассчитывается по той же теме и каналу и выводится в процентах.
 
 ```python
 parts = []
@@ -704,7 +645,6 @@ for channel, history in train.groupby("bl_type"):
     scores["total_effect"] = scores["pair_effect"] + scores.login.map(lambda login: coef["operator=" + str(login)])
     scores["within_score"] = scores["pair_effect"] - scores.groupby("login")["pair_effect"].transform("median")
     scores["peer_effect"] = np.nan
-    scores["train_peer_operators"] = scores.groupby("topic", sort=False)["login"].transform("size") - 1
     for _, group in scores.groupby("topic", sort=False):
         effects = group["total_effect"].to_numpy()
         if len(effects) < 2:
@@ -720,33 +660,27 @@ for channel, history in train.groupby("bl_type"):
     scores["peer_score"] = scores["total_effect"] - scores["peer_effect"]
     scores["peer_score_pct"] = 100 * np.expm1(scores["peer_score"])
     scores["bl_type"] = channel
-    parts.append(scores)
+    scores["topic_candidate"] = (
+        scores["train_operator_topic_episodes"].ge(20) & scores["within_score"].gt(0.15)
+    )
+    parts.append(scores[["bl_type", "login", "topic", "train_operator_topic_episodes",
+                         "peer_score_pct", "topic_candidate"]])
+score_table = pd.concat(parts, ignore_index=True)
 ```
 
-#### 5. Одна тема в строке
+#### 5. Распределение времени тем
 
-Сохраняем поля сегмента и считаем, сколько однотемных примеров было в истории канала и сотрудника.
+Для двух тем распределяем фактические секунды пропорционально однотемным прогнозам. Если прогноз недоступен или одна тема не встречалась отдельно на истории, каждой теме достаётся половина.
 
 ```python
-single = train.loc[train["topics"].str.len().eq(1), ["bl_type", "login", "topics"]].copy()
+single = train.loc[train["topics"].str.len().eq(1), ["bl_type", "topics"]].copy()
 single["topic"] = single.pop("topics").str[0]
-fact = test.drop(columns=["theme_sequence", "is_chat", "missing_theme_dates",
-                          "duplicated_theme_dates"], errors="ignore").copy()
-fact["_episode"] = np.arange(len(fact))
-fact = fact.explode("topics", ignore_index=True).rename(columns={"topics": "topic", "aht_target": "aht_duration"})
-for keys, col in [
-    (["bl_type", "topic"], "train_topic_single_episodes"),
-    (["bl_type", "login", "topic"], "train_operator_single_episodes"),
-]:
-    counts = single.groupby(keys, sort=False).size().rename(col)
-    fact = fact.join(counts, on=keys, validate="many_to_one")
-    fact[col] = fact[col].fillna(0).astype(int)
-```
+support = single.groupby(["bl_type", "topic"]).size().rename("train_topic_single_episodes")
 
-#### 6. Распределение фактического времени и норматива по темам
-
-```python
-def allocate_topic_seconds(fact):
+def allocate_topic_seconds(segments):
+    fact = segments.assign(_episode=np.arange(len(segments)), n_topics=segments["topics"].str.len())
+    fact = fact.explode("topics", ignore_index=True).rename(columns={"topics": "topic"})
+    fact = fact.join(support, on=["bl_type", "topic"], validate="many_to_one")
     two = fact["n_topics"].eq(2)
     fact["is_estimated"] = two.astype("int8")
     fact["single_prediction_sec"] = np.nan
@@ -778,134 +712,63 @@ def allocate_topic_seconds(fact):
     fact.loc[use_model, "allocation_method"] = "ridge_proportional"
 
     fact["topic_duration"] = fact["handle_duration"] * fact["allocation_weight"]
-    return fact
+    return fact.drop(columns=["single_prediction_sec", "train_topic_single_episodes", "_episode"])
+```
 
-fact = allocate_topic_seconds(fact)
+#### 6. Факт и норматив отчётного месяца
 
-plan = fact["aht_duration"].where(
-    fact["aht_duration"].gt(0) & np.isfinite(fact["aht_duration"])
-)
+Формируем строку на каждую тему сегмента. Фактическое время и норматив делятся в одинаковых пропорциях.
+
+```python
+ref_keys = ["bl_type", "med_name", "topic", "n_topics"]
+fact = allocate_topic_seconds(test.drop(columns=["theme_sequence", "is_chat",
+    "missing_theme_dates", "duplicated_theme_dates"], errors="ignore"))
+fact = fact.rename(columns={"aht_target": "aht_duration"})
+plan = fact["aht_duration"].where(fact["aht_duration"].gt(0) & np.isfinite(fact["aht_duration"]))
 fact["topic_plan_seconds"] = plan * fact["allocation_weight"]
 fact["episode_plan_pct"] = 100 * plan / fact["handle_duration"]
 ```
 
-#### Проверка отставания на однотемных сегментах test
+#### 7. Медиана за три календарных месяца
 
-Ориентир — медиана эпизодов остальных операторов на той же теме, в том же канале и проекте.
-
-```python
-keys = ["bl_type", "med_name", "topic"]
-count_keys = keys + ["login"]
-test_single = test[test["topics"].str.len() == 1].copy()
-test_single["topic"] = test_single["topics"].str[0]
-
-rows = []
-
-for (bl_type, med_name, topic), part in test_single.groupby(keys, dropna=False):
-    for login, operator in part.groupby("login"):
-        peers = part[part["login"] != login]
-
-        rows.append({
-            "bl_type": bl_type,
-            "med_name": med_name,
-            "topic": topic,
-            "login": login,
-            "test_episodes": len(operator),
-            "peer_episodes": len(peers),
-            "peer_operators": peers["login"].nunique(),
-            "test_operator_median": operator["handle_duration"].median(),
-            "test_peer_median": peers["handle_duration"].median(),
-        })
-
-validation = pd.DataFrame(rows, columns=[
-    *count_keys, "test_episodes", "peer_episodes", "peer_operators",
-    "test_operator_median", "test_peer_median",
-])
-
-validation["test_difference_pct"] = (
-    validation["test_operator_median"] / validation["test_peer_median"] - 1
-) * 100
-
-```
-
-Медиана train: 
+Берём два месяца до отчётного и доступные дни самого отчётного месяца. Медиана считается по эпизодам всех сотрудников одного канала и проекта, отдельно для каждой темы и числа тем в сегменте.
 
 ```python
-ref_keys = ["bl_type", "med_name", "topic", "n_topics"]
-support_keys = ["bl_type", "topic"]
+window_start = (month - 2).start_time
+recent_train = train.loc[train["seg_start"].ge(window_start)]
+parts_for_median = [fact[ref_keys + ["topic_duration"]]]
+for offset in range(0, len(recent_train), 100_000):
+    chunk = allocate_topic_seconds(recent_train.iloc[offset:offset + 100_000])
+    parts_for_median.append(chunk[ref_keys + ["topic_duration"]])
 
-support = single.groupby(support_keys).size().rename("train_topic_single_episodes")
-
-history_parts = []
-
-for start_row in range(0, len(train), 100_000):
-    part = train.iloc[start_row:start_row + 100_000].copy()
-    part["_episode"] = np.arange(len(part))
-    part["n_topics"] = part["topics"].str.len()
-    part = part.explode("topics", ignore_index=True).rename(columns={"topics": "topic"})
-    part = part.join(support, on=support_keys)
-
-    part = allocate_topic_seconds(part)
-    history_parts.append(part[ref_keys + ["topic_duration"]])
-
-history = pd.concat(history_parts, ignore_index=True)
-train_median = (
-    history.groupby(ref_keys, dropna=False)["topic_duration"]
-    .median()
-    .rename("train_median_sec")
+median_3m = (
+    pd.concat(parts_for_median, ignore_index=True)
+    .groupby(ref_keys, dropna=False)["topic_duration"].median()
+    .rename("median_3m_sec")
 )
-
-fact = fact.join(train_median, on=ref_keys, validate="many_to_one")
-fact["gap_to_median_sec"] = fact["topic_duration"] - fact["train_median_sec"]
-
-del history, history_parts
+del parts_for_median, recent_train
+fact = fact.join(median_3m, on=ref_keys, validate="many_to_one")
 ```
-#### 8. Итоговый датасет
 
-Добавляем скоры и уровни темы. Проверяем число строк и сумму секунд отдельно для каждого сегмента.
+#### 8. Детальная витрина для БД
 
 ```python
-keys = ["bl_type", "login", "topic"]
-score_cols = ["train_operator_topic_episodes", "train_peer_operators", "pair_effect", "total_effect",
-              "within_score", "peer_effect", "peer_score", "peer_score_pct"]
-if parts:
-    fact = fact.merge(pd.concat(parts, ignore_index=True)[keys + score_cols],
-                      on=keys, how="left", validate="many_to_one")
-else:
-    for col in score_cols:
-        fact[col] = np.nan
+fact = fact.merge(score_table, on=["bl_type", "login", "topic"], how="left", validate="many_to_one")
 fact["train_operator_topic_episodes"] = fact["train_operator_topic_episodes"].fillna(0).astype(int)
-fact = fact.merge(validation, on=count_keys, how="left", validate="many_to_one")
-fact["test_episodes"] = fact["test_episodes"].fillna(0).astype(int)
-min_train_episodes = 20
-min_within_score = 0.15
-
-fact["topic_candidate"] = (
-    fact["train_operator_topic_episodes"].ge(min_train_episodes)
-    & fact["within_score"].gt(min_within_score)
-)
-
+fact["topic_candidate"] = fact["topic_candidate"].eq(True)
 levels = ["level1", "level2", "level3"]
-fact[levels] = pd.DataFrame(fact.pop("topic").tolist(), columns=levels, index=fact.index)
+fact[levels] = pd.DataFrame(fact.pop("topic").tolist(), index=fact.index, columns=levels)
 fact["report_month"] = month.start_time.date()
-fact["train_before"] = start.date()
-fact["model_version"] = "ridge_topic_allocation_v3"
-fact["model_alpha"] = fact["bl_type"].map({ch: m.alpha for ch, (_, m, _) in models.items()})
-
-g = fact.groupby("_episode", sort=False)
-assert len(g) == len(test) and g.size().eq(g["n_topics"].first()).all()
-assert np.allclose(g["allocation_weight"].sum(), 1)
-assert np.allclose(g["topic_duration"].sum(), g["handle_duration"].first())
-assert not fact.duplicated(episode_key + levels).any()
-operator_topic_fact = fact.drop(columns="_episode")
-display(operator_topic_fact.head())
+fact["model_version"] = "ridge_topic_allocation_v1"
+fact["model_alpha"] = 30
+operator_topic_fact = fact
 ```
 
-## Аналитический отчёт за отчётный месяц
+### Аналитический отчёт за отчётный месяц
 
-#### 1. Подготовить данные
+#### 1. Подготовка данных
 
-Каждая тема встречается в сегменте один раз. В расчёт плана и факта включаем одни и те же строки с известным нормативом. Для двухтемных сегментов берём выделенную теме долю секунд.
+Для сравнения с нормативом берём строки с известным планом. Для сравнения с медианой используем распределённые секунды каждой темы.
 
 ```python
 source = operator_topic_fact
@@ -913,12 +776,15 @@ topic_keys = ["report_month", "bl_type", "med_name", "level1", "level2", "level3
 person_keys = topic_keys + ["login"]
 
 known_plan = source["topic_plan_seconds"].gt(0)
-report = source.assign(fact_with_plan=source["topic_duration"].where(known_plan))
+report = source.assign(
+    fact_with_plan=source["topic_duration"].where(known_plan),
+    gap_to_median_sec=source["topic_duration"] - source["median_3m_sec"],
+)
 ```
 
-#### 2. Посчитать результат каждого сотрудника на теме
+#### 2. Показатели сотрудника по теме
 
-Счётчики проверки уже рассчитаны в модели и повторяются на строках одной группы. Берём их один раз. Эпизоды и распределённые секунды суммируем по строкам темы.
+Суммируем отклонения от трёхмесячной медианы за отчётный период. Быстрые эпизоды компенсируют медленные. Отрицательный итог заменяем нулём.
 
 ```python
 people = report.groupby(person_keys, dropna=False, sort=False).agg(
@@ -927,10 +793,6 @@ people = report.groupby(person_keys, dropna=False, sort=False).agg(
     estimated=("is_estimated", "sum"),
     fact_sec=("fact_with_plan", "sum"),
     plan_sec=("topic_plan_seconds", "sum"),
-    single_episodes=("test_episodes", "first"),
-    peer_episodes=("peer_episodes", "first"),
-    peer_operators=("peer_operators", "first"),
-    peer_gap_pct=("test_difference_pct", "first"),
     topic_candidate=("topic_candidate", "first"),
     train_episodes=("train_operator_topic_episodes", "first"),
     peer_score_pct=("peer_score_pct", "first"),
@@ -951,12 +813,11 @@ people["plan_avg_sec"] = people["plan_sec"] / n
 people["plan_pct"] = 100 * people["plan_sec"] / people["fact_sec"].where(n.notna())
 people["over_sec"] = (people["fact_sec"] - people["plan_sec"]).where(n.notna())
 people["estimated_pct"] = 100.0 * people["estimated"] / people["episodes"]
-assert people["estimated_pct"].between(0, 100).all()
 ```
 
-#### 3. Определить кандидатов на обучение
+#### 3. Отбор на обучение
 
-Для действующего сотрудника нужны минимум 20 эпизодов по теме на истории, within_score > 0.15 и превышение норматива за месяц. Модель сравнивает сотрудника с коллегами по теме внутри канала на истории. Месячное сравнение однотемных эпизодов внутри проекта выводится справочно.
+Выбираем действующих сотрудников с историческим сигналом и превышением плана. Дата проверки занятости — последняя доступная дата отчётного периода.
 
 ```python
 as_of = source.groupby("report_month")["seg_start"].transform("max").dt.normalize()
@@ -974,30 +835,98 @@ people["to_train"] = (
     & people["below_plan"]
     & people["topic_candidate"]
 )
-
 ```
 
-#### 4. Срез по сотрудникам
+#### 4. Итоговый список назначений
 
-Одна строка — одно назначение. У каждого сотрудника первой показываем тему с наибольшим суммарным превышением. Факт и план в среднем рассчитаны на эпизод с известным нормативом.
+В employee_report сохраняем канал, проект, сотрудника и одну тему. Список отсортирован по потенциалу в секундах. Внутренний скор используется только в отборе.
 
 ```python
 labels = {
     "report_month": "Месяц", "login": "Сотрудник", "bl_type": "Канал", "med_name": "Проект",
     "level1": "Уровень 1", "level2": "Уровень 2", "level3": "Уровень 3",
     "episodes": "Эпизодов", "with_plan": "С нормативом", "estimated_pct": "Из двухтемных, %",
-    "single_episodes": "Однотемных у сотрудника", "peer_episodes": "Однотемных у коллег",
-    "peer_operators": "Коллег", "peer_gap_pct": "Дольше коллег, %",
     "plan_avg_sec": "План на эпизод, с", "fact_avg_sec": "Факт на эпизод, с",
     "plan_pct": "Выполнение, %", "over_sec": "Превышение за месяц, с",
-    "median_gain_sec": "Потенциал до медианы за месяц, с",
+    "median_gain_sec": "Потенциал до медианы 3 мес. за отчётный период, с",
     "train_episodes": "Эпизодов на истории",
     "peer_score_pct": "Отклонение от коллег по модели, %",
 }
 employee_report = (
     people.loc[people["to_train"]].sort_values(
-        ["report_month", "login", "over_sec"], ascending=[True, True, False]
+        ["median_gain_sec", "over_sec"], ascending=False
     )[list(labels)].rename(columns=labels).reset_index(drop=True)
 )
 display(employee_report.round(1))
 ```
+
+### Приложение. Диагностика модели
+
+#### 1. Проверка витрины и MAE
+
+
+```python
+def check_model():
+    g = operator_topic_fact.groupby(episode_key, sort=False, dropna=False)
+    assert len(g) == len(test)
+    assert not operator_topic_fact.duplicated(episode_key + levels).any()
+    assert np.allclose(g["allocation_weight"].sum(), 1)
+    assert np.allclose(g["topic_duration"].sum(), g["handle_duration"].first())
+    keys = ["bl_type", "med_name", "topic"]
+
+    train_single = train[train["topics"].str.len() == 1].copy()
+    train_single["topic"] = train_single["topics"].str[0]
+
+    topic_median = (
+        train_single.groupby(keys, dropna=False)["handle_duration"]
+        .median()
+        .rename("topic_baseline")
+        .reset_index()
+    )
+
+    channel_median = train.groupby("bl_type")["handle_duration"].median()
+
+    metrics = []
+
+    for name, frame in [("train", train), ("test", test)]:
+        check = frame.copy()
+        check["prediction"] = np.nan
+        for channel, part in check.groupby("bl_type"):
+            if channel in models:
+                vec, model, fill_days = models[channel]
+                X = vec.transform(make_features(part, fill_days))
+                check.loc[part.index, "prediction"] = np.exp(model.predict(X))
+        check = check.dropna(subset=["prediction"])
+        check["channel_baseline"] = check["bl_type"].map(channel_median)
+        check["topic"] = check["topics"].str[0]
+        check = check.merge(topic_median, on=keys, how="left", validate="many_to_one")
+        check["topic_baseline"] = check["topic_baseline"].fillna(
+            check["channel_baseline"]
+        )
+
+        for scope in ["все", "одна тема"]:
+            sample = check if scope == "все" else check[check["topics"].str.len() == 1]
+
+            for bl_type, part in sample.groupby("bl_type"):
+                y = part["handle_duration"]
+                model_mae = (y - part["prediction"]).abs().mean()
+                baseline = "channel_baseline" if scope == "все" else "topic_baseline"
+                baseline_mae = (y - part[baseline]).abs().mean()
+
+                metrics.append({
+                    "sample": name,
+                    "scope": scope,
+                    "bl_type": bl_type,
+                    "episodes": len(part),
+                    "model_mae": model_mae,
+                    "baseline_mae": baseline_mae,
+                    "improvement_pct": 100 * (1 - model_mae / baseline_mae)
+                    if baseline_mae > 0 else np.nan,
+                })
+
+    model_quality = pd.DataFrame(metrics)
+    return model_quality.round(1)
+
+# display(check_model())
+```
+
