@@ -1,22 +1,12 @@
 # Западающие темы операторов · ежемесячный отчёт
 
-Модель ищет темы, на которых сотрудник исторически тратит больше времени с учётом своего обычного темпа, темы и проекта. Список на обучение объединяет этот сигнал с фактическим превышением норматива за отчётный период.
-
-| Результат | Одна строка | Для чего используется |
-|---|---|---|
-| `operator_topic_fact` | Месяц × сегмент оператора × тема | Ежемесячная витрина с секундами, нормативом, ориентирами и скорами |
-| `employee_report` | Месяц × канал × проект × сотрудник × тема | Список назначений в порядке убывания потенциальной экономии |
-
-**Порядок запуска.** Подготовьте SQL-источник, загрузите данные, выполните первичную обработку, модель и аналитический отчёт. Для повторного расчёта на том же загруженном периоде достаточно начать с настроек модели. Приложение с проверками запускается отдельно. Загрузчик читает год из переменной `year`. Для расчёта на границе года подготовьте историю за нужные годы до запуска модели.
-
 ## I. SQL · исходные сегменты
 
 Сначала создали срез данных c информацией о дате приема и увольнения: 
 ```sql
 create table iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
 with (
-    -- Пример пути. Подставь доступную пустую папку для новой таблицы.
-    location = 's3://example-bucket/sandbox_cc/operator_theme_ml_model_v3_7f3a/'
+    location = ''
 )
 as
 with
@@ -356,17 +346,18 @@ class DatalakeClient:
 config = TrinoConfig.from_env()
 lake = DatalakeClient(config)
 
-year = 2025
-sql_25 = f"""
-SELECT *
-FROM iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
-WHERE seg_start >= TIMESTAMP '{year}-01-01 00:00:00'
-  AND seg_start < TIMESTAMP '{year + 1}-01-01 00:00:00'
-"""
 
-df = lake.read_dataframe(sql_25)
-#df = pd.concat([df_2025, df_2026], ignore_index=True)
-#del df_2025, df_2026
+report_date = pd.Timestamp("2026-10-31")
+month = pd.Period("2026-10", freq="M")
+if report_date < month.start_time:
+    raise ValueError("Отчётная дата раньше выбранного месяца")
+cutoff = min(report_date.normalize() + pd.Timedelta(days=1), (month + 1).start_time)
+sql = f"""
+select *
+from iceberg__write_access.sandbox_cc.operator_theme_ml_model_v3
+where seg_start < timestamp '{cutoff:%Y-%m-%d %H:%M:%S}'
+"""
+df = lake.read_dataframe(sql)
 ```
 
 ## III. Первичная обработка
@@ -548,16 +539,16 @@ display(
 
 ### 1. Период обучения и расчёта
 
-При `report_month = None` используется последний месяц загруженных данных. Ridge обучается на более ранних сегментах без сессий отчётного месяца.
+Месяц и последний включённый день заданы в разделе II. Ridge обучается на более ранних сегментах без сессий отчётного месяца.
 
 ```python
 import numpy as np
 
-report_month = None       # например, "2026-10"
+
 ALPHA = 30
 MIN_TRAIN_EPISODES = 20
 MIN_WITHIN_SCORE = 0.15
-USE_TENURE_BINS = False   # вкл для сравнения на тех же месяцах
+USE_TENURE_BINS = False
 
 eligible = (
     df_model["n_topics"].isin([1, 2])
@@ -565,10 +556,8 @@ eligible = (
     & df_model["handle_duration"].gt(0)
 )
 
-last_date = df_model.loc[eligible, "seg_start"].max()
-month = pd.Period(report_month or last_date, freq="M")
 start = month.start_time
-end = (month + 1).start_time
+end = cutoff
 data = df_model.loc[eligible]
 test = data.loc[data["seg_start"].between(start, end, inclusive="left")].copy()
 train = data.loc[data["seg_start"] < start, [
@@ -783,83 +772,36 @@ fact["model_alpha"] = ALPHA
 operator_topic_fact = fact
 ```
 
-### 9. Запись месяца в Iceberg через Trino
+### 9. Запись детальной витрины
 
-Выполните ячейку после проверки отчётного периода. В переменной окружения `OPERATOR_TOPIC_FACT_LOCATION` укажите отдельный S3-путь для детальной витрины. Путь используется при создании таблицы. Требуются права на создание временной таблицы в схеме, запись и `merge` в Iceberg. Для одного месяца запускайте одну публикацию за раз.
+Положите `month_writer.py` рядом с ноутбуком. Один раз при настройке окружения импортируйте ваш корпоративный WebHDFSHook тем же импортом, что в рабочем примере. В примере путь импорта скрыт. Создайте клиент после инициализации lake. В .env задайте WEBHDFS_HOST и WEBHDFS_CA_BUNDLE.
 
 ```python
-# Загружаем витрину порциями и одним merge публикуем полный месяц.
-import os
-from contextlib import closing
-from uuid import uuid4
+from month_writer import MonthWriter
 
-def write_fact_month(lake, frame, month, location):
-    schema = "iceberg__write_access.sandbox_cc"
-    target = f"{schema}.operator_topic_fact"
-    stage = f"{schema}.stage_topic_{uuid4().hex}"
-    day = month.start_time.date()
-    if frame.empty or not frame["report_month"].eq(day).all():
-        raise ValueError("Ожидается непустая витрина за один отчётный месяц")
-    if frame.duplicated(episode_key + levels).any():
-        raise ValueError("Повтор ключа сегмент × тема")
-    if not location.startswith("s3://") or "'" in location:
-        raise ValueError("Укажите отдельный S3-путь витрины")
+settings = dict(dotenv_values(".env"))
+settings.update(os.environ)
+hook = WebHDFSHook(
+    webhdfs_conn_id=None,
+    host=settings["WEBHDFS_HOST"],
+    port=443,
+    kerberos=True,
+    ca_cert=settings["WEBHDFS_CA_BUNDLE"],
+    use_https=True,
+)
 
-    groups = {
-        "varchar": "session_id segment client_id login portal_id city fio su med_name bl_type allocation_method level1 level2 level3 model_version",
-        "date": "start_dt report_month",
-        "timestamp(6)": "seg_start seg_end employment_date fired_date",
-        "bigint": "n_topics is_estimated train_operator_topic_episodes model_alpha",
-        "boolean": "topic_candidate",
-        "double": "handle_duration tenure_days aht_duration allocation_weight topic_duration topic_plan_seconds episode_plan_pct mean_3m_sec within_score peer_effect peer_score peer_score_pct",
-    }
-    types = {col: typ for typ, names in groups.items() for col in names.split()}
-    if set(frame) != set(types):
-        raise ValueError(f"Расхождение схемы: {sorted(set(frame) ^ set(types))}")
-    cols = ", ".join(types)
-    ddl = ", ".join(f"{col} {typ}" for col, typ in types.items())
-    projection = ", ".join(
-        f"cast(json_extract_scalar(item, '$[{i}]') as {typ})"
-        for i, typ in enumerate(types.values())
-    )
-    values = ", ".join(f"s.{col}" for col in types)
-    with closing(lake.connect()) as conn, closing(conn.cursor()) as cur:
-        def run(sql, params=None):
-            cur.execute(sql, params)
-            return cur.fetchall()
-
-        run(f"""create table if not exists {target} ({ddl})
-            with (location = '{location}', format = 'PARQUET',
-                  partitioning = array['report_month'], format_version = 2)""")
-        run(f"create table {stage} as select {cols} from {target} with no data")
-        try:
-            for offset in range(0, len(frame), 1000):
-                batch = frame.iloc[offset:offset + 1000].loc[:, list(types)].copy()
-                for col, typ in types.items():
-                    if typ in ("date", "timestamp(6)"):
-                        fmt = "%Y-%m-%d" if typ == "date" else "%Y-%m-%d %H:%M:%S.%f"
-                        batch[col] = pd.to_datetime(batch[col]).dt.strftime(fmt)
-                payload = batch.to_json(orient="values", double_precision=15)
-                run(f"""insert into {stage} ({cols})
-                    select {projection}
-                    from unnest(cast(json_parse(?) as array(json))) as rows_in(item)""",
-                    [payload])
-            if run(f"select count(*) from {stage}")[0][0] != len(frame):
-                raise ValueError("Число загруженных строк отличается от размера витрины")
-
-            # Одна служебная строка удаляет старый месяц, остальные вставляют новый.
-            run(f"""merge into {target} t using (
-                    select *, false as clear_month from {stage}
-                    union all
-                    select *, true as clear_month from (select * from {stage} limit 1)
-                ) s on s.clear_month and t.report_month = s.report_month
-                when matched then delete
-                when not matched and not s.clear_month then insert ({cols}) values ({values})""")
-        finally:
-            run(f"drop table {stage}")
-
-write_fact_month(lake, operator_topic_fact, month, os.environ["OPERATOR_TOPIC_FACT_LOCATION"])
+location = settings["OPERATOR_TOPIC_FACT_LOCATION"]
+writer = MonthWriter(lake, hook.get_conn(), location)
 ```
+
+Ежемесячная выгрузка занимает одну строку. Сначала класс записывает Parquet частями по 100 000 строк, затем загружает части в HDFS и регистрирует внешнюю таблицу Hive. Новый месяц вставляется через insert-select. При пересчёте используется один merge из той же Hive-таблицы. Запускайте одну публикацию месяца одновременно. Частичный месяц заменяет весь ранее сохранённый срез этого месяца.
+
+```python
+written_rows = writer.write(operator_topic_fact, month)
+print("Записано строк:", written_rows)
+```
+
+Если данные не прошли проверку, класс выводит причину и возвращает 0. Ошибки подключения и выполнения запросов видны в ноутбуке.
 
 ## V. Аналитический отчёт
 
@@ -915,7 +857,7 @@ people["over_sec"] = (people["fact_sec"] - people["plan_sec"]).where(n.notna())
 Выбираем действующих сотрудников с историческим сигналом и превышением плана. Дата проверки занятости — последняя доступная дата отчётного периода.
 
 ```python
-as_of = source.groupby("report_month")["seg_start"].transform("max").dt.normalize()
+as_of = report_date.normalize()
 active = source["employment_date"].le(as_of) & (
     source["fired_date"].isna() | source["fired_date"].gt(as_of)
 )
@@ -937,7 +879,6 @@ people["to_train"] = (
 В employee_report сохраняем канал, проект, сотрудника и одну тему. Список отсортирован по потенциалу в секундах. Внутренний скор используется только в отборе.
 
 ```python
-# Берём город и руководителя из последнего сегмента в том же канале и проекте.
 staff_keys = ["report_month", "bl_type", "med_name", "login"]
 staff_info = (
     source[staff_keys + ["seg_start", "session_id", "segment", "su", "city"]]
@@ -948,9 +889,8 @@ labels = {
     "report_month": "Месяц", "login": "Сотрудник", "bl_type": "Канал", "med_name": "Проект",
     "su": "Руководитель", "city": "Город сотрудника",
     "level1": "Уровень 1", "level2": "Уровень 2", "level3": "Уровень 3",
-    "episodes": "Эпизодов", "with_plan": "С нормативом",
-    "plan_avg_sec": "План на эпизод, с", "fact_avg_sec": "Факт на эпизод, с",
-    "plan_pct": "Выполнение, %", "over_sec": "Превышение за месяц, с",
+    "episodes": "Эпизодов", "plan_avg_sec": "План на эпизод, с", "fact_avg_sec":     "Факт на эпизод, с", "plan_pct": "Выполнение, %",
+    "over_sec": "Превышение за месяц, с",
     "mean_gain_sec": "Потенциал до среднего за 3 мес. за отчётный период, с",
     "train_episodes": "Эпизодов на истории",
 }
