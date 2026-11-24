@@ -237,3 +237,72 @@ class SparkCC:
         finally:
             self.spark.catalog.dropTempView(view)
 ```
+
+
+
+
+```python
+import os
+from spark_magic.utils import get_spark_session
+from spark_connect import SparkCC  # Класс из твоего файла spark_connect.py
+
+spark = get_spark_session(
+    "operator_topic_fact",
+    principal=os.environ["DATALAB_KERBEROS_PRINCIPAL"],
+    keytab_path=os.environ["DATALAB_KERBEROS_KEYTAB"],
+)
+
+db = SparkCC(spark)
+spark.sql("SELECT 1 AS ok").show()  # Проверяем, что сессия выполняет запросы
+
+
+
+
+
+
+table = "sandbox_cc.operator_topic_fact"
+spark.table(table).printSchema()
+
+
+
+
+
+
+
+
+from pyspark.sql import types as T
+
+pdf = operator_topic_fact
+report_day = month.start_time.date()
+
+if not pdf["report_month"].isin([report_day]).all():
+    raise ValueError(f"В выгрузке есть строки без даты или за другой месяц. Ожидается {report_day}.")
+
+if pdf.duplicated(keys).any():
+    raise ValueError("В результате модели повторяется ключ «сегмент × тема».")
+
+if pdf.empty:
+    print(f"За {report_day:%Y-%m} нет строк для загрузки.")
+else:
+    data = pdf.loc[:, target_schema.names].copy()  # Порядок полей как в таблице
+
+    for field in target_schema:
+        col = field.name
+        dtype = field.dataType
+
+        if isinstance(dtype, T.DateType):
+            data[col] = pd.to_datetime(data[col]).dt.date
+        elif isinstance(dtype, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
+            data[col] = pd.to_numeric(data[col]).astype("Int64")
+        elif isinstance(dtype, (T.FloatType, T.DoubleType)):
+            data[col] = pd.to_numeric(data[col]).astype(float)
+        elif isinstance(dtype, T.StringType):
+            data[col] = data[col].astype("string")
+
+    data = data.astype(object).where(data.notna(), None)  # Пропуски pandas → NULL
+    sdf = spark.createDataFrame(data, schema=target_schema)
+
+    db.insert_missing(table, sdf, keys)
+    print(f"Загрузка за {report_day:%Y-%m} завершена. Строк в поставке: {len(pdf):,}")
+
+```
