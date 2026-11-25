@@ -22,6 +22,10 @@ from pathlib import Path
 
 sql_dir = Path("sql_spark")
 sql_dir.mkdir(exist_ok=True)
+
+def query(filename, **params):
+    return (sql_dir / filename).read_text(encoding="utf-8").format(**params)
+
 table = "sandbox_cc.table"
 source = "sandbox_cc.source_table"
 location = "hdfs:///data/sandbox/cc/table"
@@ -53,8 +57,7 @@ TBLPROPERTIES (
 В следующей ячейке прочитайте файл, подставьте имя таблицы и путь, затем выполните SQL.
 
 ```python
-ddl = (sql_dir / "create_table.sql").read_text(encoding="utf-8")
-spark.sql(ddl.format(table=table, location=location))
+spark.sql(query("create_table.sql", table=table, location=location))
 ```
 
 ## 3. Прочитать данные за период
@@ -72,8 +75,8 @@ WHERE source_date >= DATE '{date_from}'
 ```
 
 ```python
-select_sql = (sql_dir / "select_batch.sql").read_text(encoding="utf-8")
-frame = spark.sql(select_sql.format(
+frame = spark.sql(query(
+    "select_batch.sql",
     source=source, date_from="2026-10-01", date_to="2026-11-01"
 ))
 frame.show(5)
