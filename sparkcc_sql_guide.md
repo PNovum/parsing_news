@@ -1,6 +1,6 @@
 # SparkCC в Jupyter
 
-Положите `spark_cc.py` рядом с ноутбуком. Пример создаёт Iceberg-таблицу с полями `key_1`, `key_2` и `amount`, читает выгрузку за месяц и добавляет недостающие записи. Каждый блок ниже — отдельная ячейка.
+Положите `spark_cc.py` рядом с ноутбуком. Пример создаёт Iceberg-таблицу с полями `key_1`, `key_2` и `amount`, читает выгрузку за месяц и добавляет недостающие записи. Python-блоки выполняйте в ячейках Jupyter. SQL-блоки сохраните в указанные файлы.
 
 ## 1. Инициализировать Spark
 
@@ -13,25 +13,23 @@ db = SparkCC.connect(principal="login@REALM", keytab_path="/path/to/user.keytab"
 spark = db.spark
 ```
 
-## 2. Задать таблицы и создать папку для SQL
+## 2. Создать таблицу
 
-Замените имена таблиц и укажите отдельный каталог HDFS для новой таблицы. В примере источник содержит поля `source_id`, `source_date` и `source_amount`.
+Сначала задайте имя таблицы и отдельную папку HDFS для её данных. Папка `sql_spark` рядом с ноутбуком предназначена для SQL-файлов.
 
 ```python
 from pathlib import Path
 
-Path("sql_spark").mkdir(exist_ok=True)
+sql_dir = Path("sql_spark")
+sql_dir.mkdir(exist_ok=True)
 table = "sandbox_cc.table"
 source = "sandbox_cc.source_table"
 location = "hdfs:///data/sandbox/cc/table"
 ```
 
-## 3. Создать таблицу через create_table
-
-Выполните ячейку с `%%writefile` в первой строке. Jupyter сохранит SQL в файл. В скобках `{table}` и `{location}` указываются параметры, значения которых передадим из Python. В определении таблицы задайте названия полей и их типы.
+Создайте файл `sql_spark/create_table.sql` и запишите в него определение таблицы.
 
 ```sql
-%%writefile sql_spark/create_table.sql
 CREATE TABLE IF NOT EXISTS {table} (
     key_1  STRING,
     key_2  DATE,
@@ -52,18 +50,18 @@ TBLPROPERTIES (
 )
 ```
 
-В следующей ячейке выполните файл. При повторном запуске существующая таблица сохранит данные и схему.
+В следующей ячейке прочитайте файл, подставьте имя таблицы и путь, затем выполните SQL.
 
 ```python
-db.create_table(table, "sql_spark/create_table.sql", location=location)
+ddl = (sql_dir / "create_table.sql").read_text(encoding="utf-8")
+spark.sql(ddl.format(table=table, location=location))
 ```
 
-## 4. Прочитать выгрузку через sql_file
+## 3. Прочитать данные за период
 
-Во втором SQL-файле укажите источник, сопоставьте его поля с колонками приёмника и задайте фильтр по дате. Нижняя граница входит в период, верхняя исключается.
+В файле `sql_spark/select_batch.sql` укажите поля своей исходной таблицы. В примере выбираем данные за октябрь, до 1 ноября исключительно.
 
 ```sql
-%%writefile sql_spark/select_batch.sql
 SELECT
     CAST(source_id AS STRING)     AS key_1,
     CAST(source_date AS DATE)     AS key_2,
@@ -73,19 +71,15 @@ WHERE source_date >= DATE '{date_from}'
   AND source_date <  DATE '{date_to}'
 ```
 
-Прочитайте октябрь в Spark DataFrame. Метод подставляет параметры в текст SQL, поэтому передавайте свои значения из настроек ноутбука.
-
 ```python
-frame = db.sql_file(
-    "sql_spark/select_batch.sql",
-    source=source,
-    date_from="2026-10-01",
-    date_to="2026-11-01",
-)
+select_sql = (sql_dir / "select_batch.sql").read_text(encoding="utf-8")
+frame = spark.sql(select_sql.format(
+    source=source, date_from="2026-10-01", date_to="2026-11-01"
+))
 frame.show(5)
 ```
 
-## 5. Дозагрузить данные через insert_missing
+## 4. Дозагрузить данные через insert_missing
 
 Выберите **одну** из двух ячеек в зависимости от того, что считается повтором.
 
@@ -113,32 +107,11 @@ db.insert_missing(table, frame)
 spark.table(table).show(10)
 ```
 
-## 6. Записать результат из pandas
-
-Передайте pandas DataFrame прямо в метод дозагрузки. Класс прочитает схему существующей таблицы, возьмёт нужные колонки в её порядке и преобразует значения. Поддерживаются STRING, целые типы, FLOAT, DOUBLE, BOOLEAN, DATE, TIMESTAMP и TIMESTAMP_NTZ. Для BOOLEAN используйте True/False или 1/0. Пропуски становятся NULL. Для готового Spark DataFrame подготовьте типы в исходном SELECT.
-
-```python
-db.insert_missing(table, pdf, keys=["key_1", "key_2"])
-```
-
-Чтобы получить Spark DataFrame для дальнейших вычислений отдельно от записи:
-
-```python
-sdf = db.to_spark(pdf, spark.table(table).schema)
-```
-
-В ноутбуке модели после создания fact-таблицы весь блок подготовки и записи заменяет одна строка:
+Если выгрузка уже находится в pandas DataFrame, передайте его в тот же метод. Например, для результата модели:
 
 ```python
 db.insert_missing(fact_table, operator_topic_fact, keys=fact_keys)
 ```
 
-Запускайте загрузки в одну таблицу последовательно, если ключи могут пересекаться.
+Загрузки с пересекающимися ключами в одну таблицу запускайте последовательно.
 
-## 7. Удалить таблицу
-
-Отдельная операция для случая, когда таблицу действительно нужно удалить из каталога:
-
-```python
-db.drop_table(table)
-```

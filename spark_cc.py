@@ -1,4 +1,3 @@
-from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
@@ -15,13 +14,7 @@ class SparkCC:
 
         return cls(get_spark_session(app_name, principal=principal, keytab_path=keytab_path))
 
-    def create_table(self, table, ddl_path, **params):
-        self.sql_file(ddl_path, table=table, **params).collect()
-
-    def drop_table(self, table):
-        self.spark.sql(f"DROP TABLE IF EXISTS {table}").collect()
-
-    def to_spark(self, frame, schema):
+    def _to_spark(self, frame, schema):
         """Подготовить pandas DataFrame по StructType таблицы."""
         data = {}
         for field in schema:
@@ -55,14 +48,10 @@ class SparkCC:
         rows = pd.DataFrame(data).itertuples(index=False, name=None)
         return self.spark.createDataFrame(rows, schema)
 
-    def sql_file(self, path, **params):
-        query = Path(path).read_text(encoding="utf-8").format(**params)
-        return self.spark.sql(query)
-
     def insert_missing(self, table, frame, keys=None):
         schema = self.spark.table(table).schema
         if isinstance(frame, pd.DataFrame):
-            frame = self.to_spark(frame, schema)
+            frame = self._to_spark(frame, schema)
         columns = schema.names
         data = frame.select(*columns).distinct()
         if keys is None:
